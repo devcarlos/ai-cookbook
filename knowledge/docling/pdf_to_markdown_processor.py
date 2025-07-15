@@ -500,35 +500,111 @@ class PDFToMarkdownProcessor:
             fixed_lines.append(line)
         return fixed_lines
     
-    def clean_text_simple(self, text: str) -> str:
-        """Simple text cleaning - only remove specific unwanted patterns"""
+    def clean_text(self, text: str) -> str:
+        """Comprehensive text cleaning with improvements for accents and legal codes."""
         
-        # Remove only these two specific patterns
+        # 1. Remove unwanted header/footer patterns
+        # This is done first to prevent them from joining with valid text.
         unwanted_patterns = [
             r"<!-- image -->",  # Remove image placeholders from markdown
             r"Prohibida su reproducción impresa o digital sin autorización",
+            r"Distribucion Gratuita",
+            r"PLAN ÚNICO DE CUENTAS TRIBUTARIO2",
+            r"ÍNDICE",
+            r"Acceso a Información\s+Tributaria\s+DIGITAL",
+            r"www\.impuestos\.gob\.bo",
+            r"Línea Gratuita de\s+Consultas Tributarias",
+            r"\d{3}-\d{2}-\d{4}",
+            r"Texto informativo, para\s+fines legales remitirse a\s+las disposiciones oficiales\.",
+            r"TÍTULO\s+[IVXLCDM]+\s+NORMAS\s+SUSTANTIV\s*AS\s+Y\s+MATERIALES",
+            r"CÓDIGO TRIBUTARIO BOLIVIANO\s+Y DECRETOS REGLAMENTARIOS",
+            r"TEXTO ORDENADO, COMPLEMENTADO\s+Y ACTUALIZADO AL",
+            r"CÓDIGO TRIBUTARIO BOLIVIANO\s*LEY N°",
+            r"^\s*Ley N° \d+\s*$", # Lines that only contain "Ley N° XXX"
+            r"^\s*[IVXLCDM]+\s*$", # Lines that are only Roman numerals (footers)
+            r"^\s*\d{1,3}\s*$", # Lines that are only page numbers
+            r"2492\s*2492\s*\d{1,2}/\d{1,2}/\d{4}", # The problematic header
         ]
-        
         for pattern in unwanted_patterns:
             text = re.sub(pattern, "", text, flags=re.IGNORECASE | re.MULTILINE)
+
+        # 2. Fix misencoded characters and ligatures
+        replacements = {
+            'Ã¡': 'á', 'Ã©': 'é', 'Ã­': 'í', 'Ã³': 'ó', 'Ãº': 'ú', 'Ã±': 'ñ',
+            'Á': 'Á', 'É': 'É', 'Í': 'Í', 'Ó': 'Ó', 'Ú': 'Ú', 'Ñ': 'Ñ',
+            'ﬁ': 'fi', 'ﬂ': 'fl',
+            'SUSTANTIV AS': 'SUSTANTIVAS' # Specific typo fix
+        }
+        for bad, good in replacements.items():
+            text = text.replace(bad, good)
+
+        # 3. Remove control characters except tab and newline
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+
+        # 4. Insert spaces to fix stuck words
+        # Lowercase letter followed by uppercase (e.g. "boLínea" -> "bo Línea")
+        text = re.sub(r'([a-z\.])([A-Z])', r'\1 \2', text)
+        # Letter followed by number (e.g. "Tributarias800" -> "Tributarias 800")
+        text = re.sub(r'([a-zA-ZáéíóúÁÉÍÓÚñÑ])(\d)', r'\1 \2', text)
+        # Number followed by letter (e.g. "2492CÓDIGO" -> "2492 CÓDIGO")
+        text = re.sub(r'(\d)([a-zA-ZáéíóúÁÉÍÓÚñÑ])', r'\1 \2', text)
+
+        # 5. Repair codes broken by line breaks, e.g. RND-10-\n0021-16 → RND-10-0021-16
+        text = re.sub(r'(\b[RDN]{2,3}-?\d+)[\s\n\-]+(\d{4,}-\d{2}\b)', r'\1-\2', text)
+
+        # 6. Join words cut by line break with hyphen, e.g. "au-\ntorización" → "autorización"
+        text = re.sub(r'(\w+)-\n(\w+)', r'\1\2', text)
+
+        # 7. Fix spacing in initials (e.g. P . O . -> P. O.)
+        text = re.sub(r'\b([A-Z])\s+\.\s*', r'\1. ', text)
+
+        # 8. Replace line breaks that are not preceded by punctuation or that are not paragraph breaks.
+        text = re.sub(r'(?<![.\?!:;])\n(?!\s*[\n\d\•\*\-–—a-zA-ZáéíóúÁÉÍÓÚñÑ])', ' ', text)
         
+        # # 9. Clean whitespace at beginning and end of lines
+        # lines = text.split('\n')
+        # cleaned_lines = []
+        # for line in lines:
+        #     cleaned_line = line.strip()
+        #     cleaned_lines.append(cleaned_line)
+        # text = '\n'.join(cleaned_lines)
+        
+        # 10. Remove sequences of more than 3 dots
+        # text = re.sub(r'\.{4,}', ' ', text)
+
+        # 11. Remove lines that only contain symbols or are almost empty
+        # text = '\n'.join(line for line in text.split('\n') if not re.match(r'^[.\-_\s•\*–—]+$', line.strip()))
+
+        # # 12. Remove lines that are likely garbage from stamps or noise based on character patterns
+        # # This targets lines with characters rare in Spanish or with a high density of punctuation.
+        # text = re.sub(r'^.*[~§·<>\\{}].*$\n?', '', text, flags=re.MULTILINE)
+        # text = re.sub(r'^.*([,.;:!¡¿?\'"`_]\s*){4,}.*$\n?', '', text, flags=re.MULTILINE)
+
+        # # 13. Normalize whitespace and clean extremes
+        # text = re.sub(r'[ \t]+', ' ', text).strip()
+        
+        # 14. Conservative newline cleanup - only remove excessive empty lines (4 or more consecutive)
+        # This preserves intentional paragraph breaks while removing obvious formatting artifacts
+        # text = re.sub(r'\n\s*\n\s*\n\s*\n+', '\n\n\n', text)  # Allow up to 3 newlines max
+        
+        # 15. Final conservative cleanup - only remove truly excessive newlines (2 or more)
+        # text = re.sub(r'\n{2,}', '\n\n\n', text)
+
         return text
     
     def fix_strange_characters(self, lines: List[str]) -> List[str]:
-        """Clean up strange characters while preserving important ones"""
+        """Clean up strange characters using comprehensive text cleaning"""
         fixed_lines = []
         for line in lines:
             original_line = line
             
-            # Apply simple text cleaning to each line
-            line = self.clean_text_simple(line)
+            # Apply comprehensive text cleaning to each line
+            line = self.clean_text(line)
             
-            # Additional character fixes
+            # Additional character fixes specific to line-by-line processing
             line = re.sub(r'Nº', 'N°', line)
             line = re.sub(r'N\s*°', 'N°', line)
             line = re.sub(r'\(…\)', '', line)
-            line = re.sub(r'\.{3,}', '', line)
-            line = re.sub(r'\s{3,}', ' ', line)
             line = re.sub(r'["""]', '"', line)
             line = re.sub(r"[''']", "'", line)
             line = re.sub(r'–', '-', line)
