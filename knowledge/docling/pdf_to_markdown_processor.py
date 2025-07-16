@@ -500,6 +500,59 @@ class PDFToMarkdownProcessor:
             fixed_lines.append(line)
         return fixed_lines
     
+    def clean_text_line_safe(self, text: str) -> str:
+        """Line-safe text cleaning that doesn't affect newlines"""
+        
+        # 1. Remove unwanted header/footer patterns
+        unwanted_patterns = [
+            r"<!-- image -->",  # Remove image placeholders from markdown
+            r"Prohibida su reproducción impresa o digital sin autorización",
+            r"Distribucion Gratuita",
+            r"PLAN ÚNICO DE CUENTAS TRIBUTARIO2",
+            r"ÍNDICE",
+            r"Acceso a Información\s+Tributaria\s+DIGITAL",
+            r"www\.impuestos\.gob\.bo",
+            r"Línea Gratuita de\s+Consultas Tributarias",
+            r"\d{3}-\d{2}-\d{4}",
+            r"Texto informativo, para\s+fines legales remitirse a\s+las disposiciones oficiales\.",
+            r"TÍTULO\s+[IVXLCDM]+\s+NORMAS\s+SUSTANTIV\s*AS\s+Y\s+MATERIALES",
+            r"CÓDIGO TRIBUTARIO BOLIVIANO\s+Y DECRETOS REGLAMENTARIOS",
+            r"TEXTO ORDENADO, COMPLEMENTADO\s+Y ACTUALIZADO AL",
+            r"CÓDIGO TRIBUTARIO BOLIVIANO\s*LEY N°",
+            r"2492\s*2492\s*\d{1,2}/\d{1,2}/\d{4}", # The problematic header
+        ]
+        for pattern in unwanted_patterns:
+            text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+
+        # 2. Fix misencoded characters and ligatures
+        replacements = {
+            'Ã¡': 'á', 'Ã©': 'é', 'Ã­': 'í', 'Ã³': 'ó', 'Ãº': 'ú', 'Ã±': 'ñ',
+            'Á': 'Á', 'É': 'É', 'Í': 'Í', 'Ó': 'Ó', 'Ú': 'Ú', 'Ñ': 'Ñ',
+            'ﬁ': 'fi', 'ﬂ': 'fl',
+            'SUSTANTIV AS': 'SUSTANTIVAS' # Specific typo fix
+        }
+        for bad, good in replacements.items():
+            text = text.replace(bad, good)
+
+        # 3. Remove control characters except tab and newline
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+
+        # 4. Insert spaces to fix stuck words
+        # Lowercase letter followed by uppercase (e.g. "boLínea" -> "bo Línea")
+        text = re.sub(r'([a-z\.])([A-Z])', r'\1 \2', text)
+        # Letter followed by number (e.g. "Tributarias800" -> "Tributarias 800")
+        text = re.sub(r'([a-zA-ZáéíóúÁÉÍÓÚñÑ])(\d)', r'\1 \2', text)
+        # Number followed by letter (e.g. "2492CÓDIGO" -> "2492 CÓDIGO")
+        text = re.sub(r'(\d)([a-zA-ZáéíóúÁÉÍÓÚñÑ])', r'\1 \2', text)
+
+        # 5. Fix spacing in initials (e.g. P . O . -> P. O.)
+        text = re.sub(r'\b([A-Z])\s+\.\s*', r'\1. ', text)
+
+        # 6. Normalize internal whitespace (multiple spaces/tabs to single space)
+        text = re.sub(r'[ \t]+', ' ', text)
+        
+        return text.strip()
+
     def clean_text(self, text: str) -> str:
         """Comprehensive text cleaning with improvements for accents and legal codes."""
         
@@ -558,39 +611,147 @@ class PDFToMarkdownProcessor:
         # 7. Fix spacing in initials (e.g. P . O . -> P. O.)
         text = re.sub(r'\b([A-Z])\s+\.\s*', r'\1. ', text)
 
-        # 8. Replace line breaks that are not preceded by punctuation or that are not paragraph breaks.
-        text = re.sub(r'(?<![.\?!:;])\n(?!\s*[\n\d\•\*\-–—a-zA-ZáéíóúÁÉÍÓÚñÑ])', ' ', text)
+        # 8. Conservative newline cleanup - preserve document structure
+        return self.clean_newlines_conservative(text)
+    
+    def classify_content_type(self, line: str) -> str:
+        """Classify a line as title, subtitle, paragraph, or empty"""
+        line_stripped = line.strip()
         
-        # # 9. Clean whitespace at beginning and end of lines
-        # lines = text.split('\n')
-        # cleaned_lines = []
-        # for line in lines:
-        #     cleaned_line = line.strip()
-        #     cleaned_lines.append(cleaned_line)
-        # text = '\n'.join(cleaned_lines)
+        if not line_stripped:
+            return 'empty'
         
-        # 10. Remove sequences of more than 3 dots
-        # text = re.sub(r'\.{4,}', ' ', text)
-
-        # 11. Remove lines that only contain symbols or are almost empty
-        # text = '\n'.join(line for line in text.split('\n') if not re.match(r'^[.\-_\s•\*–—]+$', line.strip()))
-
-        # # 12. Remove lines that are likely garbage from stamps or noise based on character patterns
-        # # This targets lines with characters rare in Spanish or with a high density of punctuation.
-        # text = re.sub(r'^.*[~§·<>\\{}].*$\n?', '', text, flags=re.MULTILINE)
-        # text = re.sub(r'^.*([,.;:!¡¿?\'"`_]\s*){4,}.*$\n?', '', text, flags=re.MULTILINE)
-
-        # # 13. Normalize whitespace and clean extremes
-        # text = re.sub(r'[ \t]+', ' ', text).strip()
+        # Title patterns
+        title_patterns = [
+            r'^#+\s+LEY\s+N°',
+            r'^#+\s+CÓDIGO\s+TRIBUTARIO',
+            r'^#+\s+CAPÍTULO',
+            r'^#+\s+SECCIÓN',
+            r'^#+\s+TÍTULO',
+            r'^#+\s+ANEXO',
+            r'^#+\s+Presentación',
+        ]
         
-        # 14. Conservative newline cleanup - only remove excessive empty lines (4 or more consecutive)
-        # This preserves intentional paragraph breaks while removing obvious formatting artifacts
-        # text = re.sub(r'\n\s*\n\s*\n\s*\n+', '\n\n\n', text)  # Allow up to 3 newlines max
+        # Subtitle patterns
+        subtitle_patterns = [
+            r'^#+\s+ARTÍCULO\s+\d+',
+            r'^#+\s+Disposiciones\s+Relacionadas',
+            r'^#+\s+Nota\s+del\s+Editor',
+            r'^#+\s+DECRETOS?\s+SUPREMOS?',
+            r'^#+\s+IMPUESTOS\s+NACIONALES',
+        ]
         
-        # 15. Final conservative cleanup - only remove truly excessive newlines (2 or more)
-        # text = re.sub(r'\n{2,}', '\n\n\n', text)
+        # Check for titles
+        for pattern in title_patterns:
+            if re.search(pattern, line_stripped, re.IGNORECASE):
+                return 'title'
+        
+        # Check for subtitles
+        for pattern in subtitle_patterns:
+            if re.search(pattern, line_stripped, re.IGNORECASE):
+                return 'subtitle'
+        
+        # Default to paragraph if it has content
+        if line_stripped:
+            return 'paragraph'
+        
+        return 'empty'
 
-        return text
+    def clean_newlines_conservative(self, text: str) -> str:
+        """Batch-based intelligent newline cleaning that preserves document structure"""
+        from dataclasses import dataclass
+        
+        @dataclass
+        class ContentBlock:
+            content: str
+            type: str
+            line_number: int
+            newlines_after: int
+        
+        lines = text.split('\n')
+        
+        # Convert lines to content blocks
+        blocks = []
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i]
+            content_type = self.classify_content_type(line)
+            
+            if content_type == 'empty':
+                # Count consecutive empty lines
+                empty_count = 0
+                for j in range(i, len(lines)):
+                    if lines[j].strip() == '':
+                        empty_count += 1
+                    else:
+                        break
+                
+                blocks.append(ContentBlock(
+                    content='',
+                    type='empty',
+                    line_number=i + 1,
+                    newlines_after=empty_count
+                ))
+                i += empty_count
+            else:
+                # Count newlines after this content line
+                newlines_after = 0
+                for j in range(i + 1, len(lines)):
+                    if lines[j].strip() == '':
+                        newlines_after += 1
+                    else:
+                        break
+                
+                blocks.append(ContentBlock(
+                    content=line.strip(),
+                    type=content_type,
+                    line_number=i + 1,
+                    newlines_after=newlines_after
+                ))
+                i += 1
+        
+        # Define optimal newline rules
+        optimal_rules = {
+            'title': {'before': 2, 'after': 1},      # Titles need more space before, less after
+            'subtitle': {'before': 1, 'after': 1},   # Subtitles need moderate spacing
+            'paragraph': {'before': 0, 'after': 1},  # Paragraphs need minimal spacing
+        }
+        
+        # Generate fixed content
+        fixed_lines = []
+        
+        for i, block in enumerate(blocks):
+            if block.type == 'empty':
+                continue  # Skip empty blocks, we'll add them as needed
+            
+            # Add optimal newlines before content
+            if block.type in optimal_rules:
+                newlines_before = optimal_rules[block.type]['before']
+                
+                # Don't add newlines at the very beginning
+                if i > 0 and newlines_before > 0:
+                    fixed_lines.extend([''] * newlines_before)
+            
+            # Add the content line
+            fixed_lines.append(block.content)
+            
+            # Add optimal newlines after content
+            if block.type in optimal_rules:
+                newlines_after = optimal_rules[block.type]['after']
+                if newlines_after > 0:
+                    fixed_lines.extend([''] * newlines_after)
+        
+        # Join back to text
+        result = '\n'.join(fixed_lines)
+        
+        # Remove sequences of more than 4 dots (likely formatting artifacts)
+        result = re.sub(r'\.{5,}', '...', result)
+        
+        # Normalize internal whitespace (multiple spaces/tabs to single space)
+        result = re.sub(r'[ \t]+', ' ', result)
+        
+        return result.strip()
     
     def fix_strange_characters(self, lines: List[str]) -> List[str]:
         """Clean up strange characters using comprehensive text cleaning"""
@@ -598,8 +759,19 @@ class PDFToMarkdownProcessor:
         for line in lines:
             original_line = line
             
-            # Apply comprehensive text cleaning to each line
-            line = self.clean_text(line)
+            # Apply line-safe text cleaning to each line
+            # But we need to preserve the newline character if it exists
+            has_newline = line.endswith('\n')
+            line_content = line.rstrip('\n')
+            
+            # Apply clean_text_line_safe to the line content (doesn't affect newlines)
+            cleaned_content = self.clean_text_line_safe(line_content)
+            
+            # Restore the newline if it was there originally
+            if has_newline:
+                line = cleaned_content + '\n'
+            else:
+                line = cleaned_content
             
             # Additional character fixes specific to line-by-line processing
             line = re.sub(r'Nº', 'N°', line)
@@ -759,6 +931,136 @@ class PDFToMarkdownProcessor:
         
         return fixed_lines
 
+    def classify_content_type(self, line: str) -> str:
+        """Classify a line as title, subtitle, paragraph, or empty"""
+        line_stripped = line.strip()
+        
+        if not line_stripped:
+            return 'empty'
+        
+        # Title patterns
+        title_patterns = [
+            r'^#+\s+LEY\s+N°',
+            r'^#+\s+CÓDIGO\s+TRIBUTARIO',
+            r'^#+\s+CAPÍTULO',
+            r'^#+\s+SECCIÓN',
+            r'^#+\s+TÍTULO',
+            r'^#+\s+ANEXO',
+            r'^#+\s+Presentación',
+        ]
+        
+        # Subtitle patterns
+        subtitle_patterns = [
+            r'^#+\s+ARTÍCULO\s+\d+',
+            r'^#+\s+Disposiciones\s+Relacionadas',
+            r'^#+\s+Nota\s+del\s+Editor',
+            r'^#+\s+DECRETOS?\s+SUPREMOS?',
+            r'^#+\s+IMPUESTOS\s+NACIONALES',
+        ]
+        
+        # Check for titles
+        for pattern in title_patterns:
+            if re.search(pattern, line_stripped, re.IGNORECASE):
+                return 'title'
+        
+        # Check for subtitles
+        for pattern in subtitle_patterns:
+            if re.search(pattern, line_stripped, re.IGNORECASE):
+                return 'subtitle'
+        
+        # Default to paragraph if it has content
+        if line_stripped:
+            return 'paragraph'
+        
+        return 'empty'
+
+    def fix_newlines_batch_processing(self, lines: List[str]) -> List[str]:
+        """Apply batch-based intelligent newline processing"""
+        from dataclasses import dataclass
+        
+        @dataclass
+        class ContentBlock:
+            content: str
+            type: str
+            line_number: int
+            newlines_after: int
+        
+        # Convert lines to content blocks
+        blocks = []
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i]
+            content_type = self.classify_content_type(line)
+            
+            if content_type == 'empty':
+                # Count consecutive empty lines
+                empty_count = 0
+                for j in range(i, len(lines)):
+                    if lines[j].strip() == '':
+                        empty_count += 1
+                    else:
+                        break
+                
+                blocks.append(ContentBlock(
+                    content='',
+                    type='empty',
+                    line_number=i + 1,
+                    newlines_after=empty_count
+                ))
+                i += empty_count
+            else:
+                # Count newlines after this content line
+                newlines_after = 0
+                for j in range(i + 1, len(lines)):
+                    if lines[j].strip() == '':
+                        newlines_after += 1
+                    else:
+                        break
+                
+                blocks.append(ContentBlock(
+                    content=line.strip(),
+                    type=content_type,
+                    line_number=i + 1,
+                    newlines_after=newlines_after
+                ))
+                i += 1
+        
+        # Define optimal newline rules
+        optimal_rules = {
+            'title': {'before': 2, 'after': 1},      # Titles need more space before, less after
+            'subtitle': {'before': 1, 'after': 1},   # Subtitles need moderate spacing
+            'paragraph': {'before': 0, 'after': 1},  # Paragraphs need minimal spacing
+        }
+        
+        # Generate fixed content
+        fixed_lines = []
+        
+        for i, block in enumerate(blocks):
+            if block.type == 'empty':
+                continue  # Skip empty blocks, we'll add them as needed
+            
+            # Add optimal newlines before content
+            if block.type in optimal_rules:
+                newlines_before = optimal_rules[block.type]['before']
+                
+                # Don't add newlines at the very beginning
+                if i > 0 and newlines_before > 0:
+                    for _ in range(newlines_before):
+                        fixed_lines.append('\n')
+            
+            # Add the content line
+            fixed_lines.append(block.content + '\n')
+            
+            # Add optimal newlines after content
+            if block.type in optimal_rules:
+                newlines_after = optimal_rules[block.type]['after']
+                if newlines_after > 0:
+                    for _ in range(newlines_after):
+                        fixed_lines.append('\n')
+        
+        return fixed_lines
+
     def apply_markdown_fixes(self, file_path: str) -> bool:
         """Apply all markdown fixes to the file with temporal file generation"""
         print(f"Applying markdown fixes to: {file_path}")
@@ -834,12 +1136,19 @@ class PDFToMarkdownProcessor:
         self.write_file(lines, temp_file_7)
         print(f"     Temporal file saved: {temp_file_7}")
         
-        # Step 8: Fix excessive whitespace (final step)
-        print("  8. Fixing excessive whitespace...")
-        lines = self.fix_excessive_whitespace(lines)
-        temp_file_8 = os.path.join(temp_dir, f"temp_08_excessive_whitespace_{base_filename}.md")
+        # Step 8: Apply batch newline processing (NEW STEP)
+        print("  8. Applying batch newline processing...")
+        lines = self.fix_newlines_batch_processing(lines)
+        temp_file_8 = os.path.join(temp_dir, f"temp_08_batch_newlines_{base_filename}.md")
         self.write_file(lines, temp_file_8)
         print(f"     Temporal file saved: {temp_file_8}")
+        
+        # Step 9: Fix excessive whitespace (final step)
+        print("  9. Fixing excessive whitespace...")
+        lines = self.fix_excessive_whitespace(lines)
+        temp_file_9 = os.path.join(temp_dir, f"temp_09_excessive_whitespace_{base_filename}.md")
+        self.write_file(lines, temp_file_9)
+        print(f"     Temporal file saved: {temp_file_9}")
         
         print(f"Fixed file has {len(lines)} lines")
         
@@ -868,6 +1177,7 @@ class PDFToMarkdownProcessor:
         print(f"  - {temp_file_6}")
         print(f"  - {temp_file_7}")
         print(f"  - {temp_file_8}")
+        print(f"  - {temp_file_9}")
         
         return True
     
