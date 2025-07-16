@@ -974,10 +974,11 @@ class PDFToMarkdownProcessor:
         return False
     
     def fix_table_and_indice_issues(self, lines: List[str]) -> List[str]:
-        """Fix specific issues with tables and INDICE sections"""
+        """Fix specific issues with tables and completely remove INDICE sections"""
         fixed_lines = []
         in_table_section = False
         in_indice_section = False
+        skip_malformed_table = False
         
         for i, line in enumerate(lines):
             original_line = line
@@ -986,40 +987,67 @@ class PDFToMarkdownProcessor:
             if re.search(r'TABLA\s+DE\s+CORRESPONDENCIAS', line, re.IGNORECASE):
                 in_table_section = True
                 in_indice_section = False
+                skip_malformed_table = False
                 fixed_lines.append(line)
                 continue
             
-            # Detect ÍNDICE section
-            if re.search(r'^ÍNDICE\s*$', line.strip(), re.IGNORECASE):
+            # Detect ÍNDICE section - start skipping everything from here
+            if (re.search(r'^ÍNDICE\s*$', line.strip(), re.IGNORECASE) or 
+                'ÍNDICE' in line and not self.is_table_line(line)):
                 in_indice_section = True
                 in_table_section = False
-                fixed_lines.append(line)
+                skip_malformed_table = False
+                # Skip this line and everything in the ÍNDICE section
                 continue
             
+            # Detect malformed table content that looks like INDICE remnants
+            # These are lines that have table-like structure but contain chapter/page info
+            if (re.search(r'##\s*\|\s*Capítulo\s+[IVX]+\s*\|', line, re.IGNORECASE) or
+                re.search(r'\|\s*Disposiciones\s+.*\.{5,}.*\d+\s*\|', line, re.IGNORECASE) or
+                re.search(r'\|\s*DECRETO\s+SUPREMO.*\.{5,}.*\d+\s*\|', line, re.IGNORECASE) or
+                re.search(r'\|\s*ANEXO.*\.{5,}.*\d+\s*\|', line, re.IGNORECASE) or
+                re.search(r'\|\s*Cálculo\s+de\s+la\s+Deuda.*\|', line, re.IGNORECASE) or
+                re.search(r'\|\s*REGLAMENT.*CÓDIGO.*TRIBUTARIO.*\|', line, re.IGNORECASE)):
+                skip_malformed_table = True
+                continue
+            
+            # Skip malformed table lines that are part of INDICE remnants
+            if skip_malformed_table:
+                # Check if this line is still part of the malformed table
+                if (self.is_table_line(line) or 
+                    re.search(r'^\s*\|\s*.*\s*\|\s*$', line) or
+                    re.search(r'Capítulo\s+[IVX]+', line, re.IGNORECASE) or
+                    re.search(r'\.{5,}', line) or
+                    re.search(r'DECRETO\s+SUPREMO', line, re.IGNORECASE) or
+                    re.search(r'REGLAMENT', line, re.IGNORECASE)):
+                    continue
+                else:
+                    # We've moved past the malformed table
+                    skip_malformed_table = False
+            
             # Exit table section when we encounter a new major section
-            if in_table_section and re.search(r'^##\s+(ANEXO|DECRETO|LEY\s+N°|IMPUESTOS\s+NACIONALES|ÍNDICE)', line, re.IGNORECASE):
+            if in_table_section and re.search(r'^##\s+(ANEXO|DECRETO|LEY\s+N°|IMPUESTOS\s+NACIONALES)', line, re.IGNORECASE):
                 in_table_section = False
             
             # Exit INDICE section when we encounter a new major section
-            if in_indice_section and re.search(r'^##\s+', line, re.IGNORECASE) and not re.search(r'ÍNDICE', line, re.IGNORECASE):
-                in_indice_section = False
+            if in_indice_section:
+                # Look for major section headers that would end the INDICE
+                if (re.search(r'^(IMPUESTOS\s+NACIONALES|TÍTULO\s+[IVX]+|LEY\s+N°)', line.strip(), re.IGNORECASE) and
+                    not re.search(r'ÍNDICE', line, re.IGNORECASE)):
+                    in_indice_section = False
+                else:
+                    # Still in INDICE section, skip this line
+                    continue
             
-            # FIX 2: Protect table layout in TABLAS DE CORRESPONDENCIAS section
+            # Skip everything in ÍNDICE section
+            if in_indice_section:
+                continue
+            
+            # Protect table layout in TABLAS DE CORRESPONDENCIAS section
             if in_table_section and self.is_table_line(line):
                 # Don't modify table lines at all - preserve original formatting
                 fixed_lines.append(original_line)
                 continue
-            
-            # FIX 3: Remove dots from INDICE section while preserving table structure
-            if in_indice_section:
-                # Remove sequences of dots but preserve table structure
-                if '|' in line:
-                    # This is a table row in the INDICE, remove dots but keep structure
-                    line = re.sub(r'\.{3,}', '', line)
-                    # Clean up extra spaces that might result from dot removal
-                    line = re.sub(r'\s{2,}', ' ', line)
-                    if line != original_line:
-                        self.fixes_applied['strange_characters'] += 1
                 
             fixed_lines.append(line)
         
