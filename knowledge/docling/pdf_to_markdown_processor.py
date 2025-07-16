@@ -974,8 +974,64 @@ class PDFToMarkdownProcessor:
         
         return 'empty'
 
+    def classify_detailed_content_type(self, line: str) -> str:
+        """Classify content with more detailed categories"""
+        line_stripped = line.strip()
+        
+        if not line_stripped:
+            return 'empty'
+        
+        # Title patterns (major sections)
+        title_patterns = [
+            r'^#+\s+LEY\s+N°',
+            r'^#+\s+CÓDIGO\s+TRIBUTARIO',
+            r'^#+\s+CAPÍTULO',
+            r'^#+\s+SECCIÓN',
+            r'^#+\s+TÍTULO',
+            r'^#+\s+ANEXO',
+            r'^#+\s+Presentación',
+        ]
+        
+        # Subtitle patterns (articles and subsections)
+        subtitle_patterns = [
+            r'^#+\s+ARTÍCULO\s+\d+',
+            r'^#+\s+Disposiciones\s+Relacionadas',
+            r'^#+\s+Nota\s+del\s+Editor',
+            r'^#+\s+DECRETOS?\s+SUPREMOS?',
+            r'^#+\s+IMPUESTOS\s+NACIONALES',
+        ]
+        
+        # List item patterns
+        list_patterns = [
+            r'^\d+\.\s+',  # Numbered lists: "1. ", "2. ", etc.
+            r'^[a-z]\)\s+',  # Letter lists: "a) ", "b) ", etc.
+            r'^[IVX]+\.\s+',  # Roman numeral lists: "I. ", "II. ", etc.
+            r'^-\s+[IVX]+\.',  # Roman with dash: "- I.", "- II.", etc.
+        ]
+        
+        # Check for titles
+        for pattern in title_patterns:
+            if re.search(pattern, line_stripped, re.IGNORECASE):
+                return 'title'
+        
+        # Check for subtitles
+        for pattern in subtitle_patterns:
+            if re.search(pattern, line_stripped, re.IGNORECASE):
+                return 'subtitle'
+        
+        # Check for list items
+        for pattern in list_patterns:
+            if re.search(pattern, line_stripped):
+                return 'list_item'
+        
+        # Default to paragraph if it has content
+        if line_stripped:
+            return 'paragraph'
+        
+        return 'empty'
+
     def fix_newlines_batch_processing(self, lines: List[str]) -> List[str]:
-        """Apply batch-based intelligent newline processing"""
+        """Apply batch-based intelligent newline processing with refined rules"""
         from dataclasses import dataclass
         
         @dataclass
@@ -991,7 +1047,7 @@ class PDFToMarkdownProcessor:
         
         while i < len(lines):
             line = lines[i]
-            content_type = self.classify_content_type(line)
+            content_type = self.classify_detailed_content_type(line)
             
             if content_type == 'empty':
                 # Count consecutive empty lines
@@ -1026,11 +1082,12 @@ class PDFToMarkdownProcessor:
                 ))
                 i += 1
         
-        # Define optimal newline rules
+        # Define refined newline rules
         optimal_rules = {
-            'title': {'before': 2, 'after': 1},      # Titles need more space before, less after
-            'subtitle': {'before': 1, 'after': 1},   # Subtitles need moderate spacing
-            'paragraph': {'before': 0, 'after': 1},  # Paragraphs need minimal spacing
+            'title': {'before': 1, 'after': 0},        # Titles: 1 before, 0 after (content follows directly)
+            'subtitle': {'before': 1, 'after': 0},     # Subtitles: 1 before, 0 after
+            'paragraph': {'before': 0, 'after': 0},    # Paragraphs: no extra spacing
+            'list_item': {'before': 0, 'after': 0},    # List items: no extra spacing
         }
         
         # Generate fixed content
@@ -1040,19 +1097,24 @@ class PDFToMarkdownProcessor:
             if block.type == 'empty':
                 continue  # Skip empty blocks, we'll add them as needed
             
-            # Add optimal newlines before content
-            if block.type in optimal_rules:
-                newlines_before = optimal_rules[block.type]['before']
+            # Special handling for the very first block (no leading newlines)
+            if i == 0:
+                # First content block - no leading newlines
+                fixed_lines.append(block.content + '\n')
+            else:
+                # Add optimal newlines before content
+                if block.type in optimal_rules:
+                    newlines_before = optimal_rules[block.type]['before']
+                    
+                    # Add the specified number of newlines before
+                    if newlines_before > 0:
+                        for _ in range(newlines_before):
+                            fixed_lines.append('\n')
                 
-                # Don't add newlines at the very beginning
-                if i > 0 and newlines_before > 0:
-                    for _ in range(newlines_before):
-                        fixed_lines.append('\n')
+                # Add the content line
+                fixed_lines.append(block.content + '\n')
             
-            # Add the content line
-            fixed_lines.append(block.content + '\n')
-            
-            # Add optimal newlines after content
+            # Add optimal newlines after content (usually 0 for our refined rules)
             if block.type in optimal_rules:
                 newlines_after = optimal_rules[block.type]['after']
                 if newlines_after > 0:
