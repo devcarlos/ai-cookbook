@@ -979,6 +979,7 @@ class PDFToMarkdownProcessor:
         in_table_section = False
         in_indice_section = False
         skip_malformed_table = False
+        last_was_table_line = False
         
         for i, line in enumerate(lines):
             original_line = line
@@ -988,6 +989,7 @@ class PDFToMarkdownProcessor:
                 in_table_section = True
                 in_indice_section = False
                 skip_malformed_table = False
+                last_was_table_line = False
                 fixed_lines.append(line)
                 continue
             
@@ -997,6 +999,7 @@ class PDFToMarkdownProcessor:
                 in_indice_section = True
                 in_table_section = False
                 skip_malformed_table = False
+                last_was_table_line = False
                 # Skip this line and everything in the ÍNDICE section
                 continue
             
@@ -1009,6 +1012,7 @@ class PDFToMarkdownProcessor:
                 re.search(r'\|\s*Cálculo\s+de\s+la\s+Deuda.*\|', line, re.IGNORECASE) or
                 re.search(r'\|\s*REGLAMENT.*CÓDIGO.*TRIBUTARIO.*\|', line, re.IGNORECASE)):
                 skip_malformed_table = True
+                last_was_table_line = False
                 continue
             
             # Skip malformed table lines that are part of INDICE remnants
@@ -1025,9 +1029,20 @@ class PDFToMarkdownProcessor:
                     # We've moved past the malformed table
                     skip_malformed_table = False
             
+            # NEW: Remove stray "Central" text that appears after table lines
+            # This handles the specific issue mentioned in the task
+            if (last_was_table_line and 
+                line.strip() == 'Central' and 
+                not self.is_table_line(line)):
+                # Skip this "Central" line - it's unwanted text between table and next section
+                self.fixes_applied['table_hashtag_fixes'] += 1
+                last_was_table_line = False
+                continue
+            
             # Exit table section when we encounter a new major section
             if in_table_section and re.search(r'^##\s+(ANEXO|DECRETO|LEY\s+N°|IMPUESTOS\s+NACIONALES)', line, re.IGNORECASE):
                 in_table_section = False
+                last_was_table_line = False
             
             # Exit INDICE section when we encounter a new major section
             if in_indice_section:
@@ -1035,6 +1050,7 @@ class PDFToMarkdownProcessor:
                 if (re.search(r'^(IMPUESTOS\s+NACIONALES|TÍTULO\s+[IVX]+|LEY\s+N°)', line.strip(), re.IGNORECASE) and
                     not re.search(r'ÍNDICE', line, re.IGNORECASE)):
                     in_indice_section = False
+                    last_was_table_line = False
                 else:
                     # Still in INDICE section, skip this line
                     continue
@@ -1047,9 +1063,14 @@ class PDFToMarkdownProcessor:
             if in_table_section and self.is_table_line(line):
                 # Don't modify table lines at all - preserve original formatting
                 fixed_lines.append(original_line)
+                last_was_table_line = True
                 continue
-                
+            
+            # Track if current line is a table line for next iteration
+            current_is_table_line = self.is_table_line(line)
+            
             fixed_lines.append(line)
+            last_was_table_line = current_is_table_line
         
         return fixed_lines
     
