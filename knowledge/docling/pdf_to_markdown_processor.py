@@ -509,7 +509,6 @@ class PDFToMarkdownProcessor:
             r"Prohibida su reproducción impresa o digital sin autorización",
             r"Distribucion Gratuita",
             r"PLAN ÚNICO DE CUENTAS TRIBUTARIO2",
-            r"ÍNDICE",
             r"Acceso a Información\s+Tributaria\s+DIGITAL",
             r"www\.impuestos\.gob\.bo",
             r"Línea Gratuita de\s+Consultas Tributarias",
@@ -756,8 +755,14 @@ class PDFToMarkdownProcessor:
     def fix_strange_characters(self, lines: List[str]) -> List[str]:
         """Clean up strange characters using comprehensive text cleaning"""
         fixed_lines = []
-        for line in lines:
+        for i, line in enumerate(lines):
             original_line = line
+            
+            # Check if this line is in a table section and should be protected
+            if self.is_in_table_section(lines, i) and self.is_table_line(line):
+                # Protect table lines from character modifications
+                fixed_lines.append(original_line)
+                continue
             
             # Apply line-safe text cleaning to each line
             # But we need to preserve the newline character if it exists
@@ -791,8 +796,15 @@ class PDFToMarkdownProcessor:
     def fix_excessive_whitespace(self, lines: List[str]) -> List[str]:
         """Fix excessive whitespace issues"""
         fixed_lines = []
-        for line in lines:
+        for i, line in enumerate(lines):
             original_line = line
+            
+            # IMPROVED: Check if this line is a table line (has pipe characters)
+            # Protect ALL table lines from whitespace modifications
+            if self.is_table_line(line):
+                # Protect table lines from whitespace modifications
+                fixed_lines.append(original_line)
+                continue
             
             line = re.sub(r' {2,}', ' ', line)
             line = re.sub(r'\t+', ' ', line)
@@ -805,19 +817,58 @@ class PDFToMarkdownProcessor:
         return fixed_lines
     
     def fix_dash_separators(self, lines: List[str]) -> List[str]:
-        """Remove unwanted dash separators (table remnants)"""
+        """Remove unwanted dash separators (table remnants) while preserving legitimate table separators"""
         fixed_lines = []
         for line in lines:
+            # Check if this is a legitimate markdown table separator
+            # Pattern: |---|---|---| or |-----|-----|-----|
+            if self.is_legitimate_table_separator(line):
+                # This is a legitimate table separator, keep it
+                fixed_lines.append(line)
+                continue
+            
+            # Remove lines that are only dashes and pipes but NOT legitimate table separators
             if re.match(r'^[\s\-\|]+$', line.strip()) and len(line.strip()) > 10:
                 self.fixes_applied['dash_separators'] += 1
                 continue
             
+            # Remove long dash sequences that are not in tables and have no words
             if re.search(r'\-{5,}', line) and '|' not in line and not re.search(r'\w', line):
                 self.fixes_applied['dash_separators'] += 1
                 continue
             
             fixed_lines.append(line)
         return fixed_lines
+    
+    def is_legitimate_table_separator(self, line: str) -> bool:
+        """Check if a line is a legitimate markdown table separator"""
+        stripped = line.strip()
+        
+        # Must start and end with |
+        if not (stripped.startswith('|') and stripped.endswith('|')):
+            return False
+        
+        # Must contain only |, -, and spaces
+        if not re.match(r'^[\|\-\s]+$', stripped):
+            return False
+        
+        # Must have at least 2 columns (at least 3 | characters)
+        if stripped.count('|') < 3:
+            return False
+        
+        # Split by | and check each column separator
+        parts = stripped.split('|')[1:-1]  # Remove empty first and last parts
+        
+        # Each part should be only dashes and spaces, with at least one dash
+        for part in parts:
+            if not part.strip():  # Empty part
+                continue
+            if not re.match(r'^[\-\s]+$', part):  # Not only dashes and spaces
+                return False
+            if '-' not in part:  # No dashes at all
+                return False
+        
+        return True
     
     def fix_new_requirements(self, lines: List[str]) -> List[str]:
         """Fix issues based on new requirements"""
@@ -903,6 +954,74 @@ class PDFToMarkdownProcessor:
             
             fixed_lines.append(line)
             i += 1
+        
+        return fixed_lines
+    
+    def is_table_line(self, line: str) -> bool:
+        """Check if a line is part of a table structure"""
+        return '|' in line and line.strip().count('|') >= 2
+    
+    def is_in_table_section(self, lines: List[str], current_index: int) -> bool:
+        """Check if current line is within a TABLA DE CORRESPONDENCIAS section"""
+        # Look backwards for the table section header
+        for i in range(current_index - 1, max(0, current_index - 20), -1):
+            if re.search(r'TABLA\s+DE\s+CORRESPONDENCIAS', lines[i], re.IGNORECASE):
+                # Check if we've hit a new major section since then
+                for j in range(i + 1, current_index):
+                    if re.search(r'^##\s+(ANEXO|DECRETO|LEY\s+N°|IMPUESTOS\s+NACIONALES|ÍNDICE)', lines[j], re.IGNORECASE):
+                        return False
+                return True
+        return False
+    
+    def fix_table_and_indice_issues(self, lines: List[str]) -> List[str]:
+        """Fix specific issues with tables and INDICE sections"""
+        fixed_lines = []
+        in_table_section = False
+        in_indice_section = False
+        
+        for i, line in enumerate(lines):
+            original_line = line
+            
+            # Detect TABLA DE CORRESPONDENCIAS section
+            if re.search(r'TABLA\s+DE\s+CORRESPONDENCIAS', line, re.IGNORECASE):
+                in_table_section = True
+                in_indice_section = False
+                fixed_lines.append(line)
+                continue
+            
+            # Detect ÍNDICE section
+            if re.search(r'^ÍNDICE\s*$', line.strip(), re.IGNORECASE):
+                in_indice_section = True
+                in_table_section = False
+                fixed_lines.append(line)
+                continue
+            
+            # Exit table section when we encounter a new major section
+            if in_table_section and re.search(r'^##\s+(ANEXO|DECRETO|LEY\s+N°|IMPUESTOS\s+NACIONALES|ÍNDICE)', line, re.IGNORECASE):
+                in_table_section = False
+            
+            # Exit INDICE section when we encounter a new major section
+            if in_indice_section and re.search(r'^##\s+', line, re.IGNORECASE) and not re.search(r'ÍNDICE', line, re.IGNORECASE):
+                in_indice_section = False
+            
+            # FIX 2: Protect table layout in TABLAS DE CORRESPONDENCIAS section
+            if in_table_section and self.is_table_line(line):
+                # Don't modify table lines at all - preserve original formatting
+                fixed_lines.append(original_line)
+                continue
+            
+            # FIX 3: Remove dots from INDICE section while preserving table structure
+            if in_indice_section:
+                # Remove sequences of dots but preserve table structure
+                if '|' in line:
+                    # This is a table row in the INDICE, remove dots but keep structure
+                    line = re.sub(r'\.{3,}', '', line)
+                    # Clean up extra spaces that might result from dot removal
+                    line = re.sub(r'\s{2,}', ' ', line)
+                    if line != original_line:
+                        self.fixes_applied['strange_characters'] += 1
+                
+            fixed_lines.append(line)
         
         return fixed_lines
     
@@ -1098,8 +1217,9 @@ class PDFToMarkdownProcessor:
                 continue  # Skip empty blocks, we'll add them as needed
             
             # Special handling for the very first block (no leading newlines)
+            # FIX 1: Remove newline before header - start directly with content
             if i == 0:
-                # First content block - no leading newlines
+                # First content block - no leading newlines at all
                 fixed_lines.append(block.content + '\n')
             else:
                 # Add optimal newlines before content
@@ -1184,33 +1304,40 @@ class PDFToMarkdownProcessor:
         self.write_file(lines, temp_file_5)
         print(f"     Temporal file saved: {temp_file_5}")
         
-        # Step 6: Fix scattered letters
-        print("  6. Fixing scattered letters...")
-        lines = self.fix_scattered_letters(lines)
-        temp_file_6 = os.path.join(temp_dir, f"temp_06_scattered_letters_{base_filename}.md")
+        # Step 6: Fix table and INDICE issues (NEW STEP)
+        print("  6. Fixing table and INDICE issues...")
+        lines = self.fix_table_and_indice_issues(lines)
+        temp_file_6 = os.path.join(temp_dir, f"temp_06_table_indice_{base_filename}.md")
         self.write_file(lines, temp_file_6)
         print(f"     Temporal file saved: {temp_file_6}")
         
-        # Step 7: Fix strange characters
-        print("  7. Fixing strange characters...")
-        lines = self.fix_strange_characters(lines)
-        temp_file_7 = os.path.join(temp_dir, f"temp_07_strange_characters_{base_filename}.md")
+        # Step 7: Fix scattered letters
+        print("  7. Fixing scattered letters...")
+        lines = self.fix_scattered_letters(lines)
+        temp_file_7 = os.path.join(temp_dir, f"temp_07_scattered_letters_{base_filename}.md")
         self.write_file(lines, temp_file_7)
         print(f"     Temporal file saved: {temp_file_7}")
         
-        # Step 8: Apply batch newline processing (NEW STEP)
-        print("  8. Applying batch newline processing...")
-        lines = self.fix_newlines_batch_processing(lines)
-        temp_file_8 = os.path.join(temp_dir, f"temp_08_batch_newlines_{base_filename}.md")
+        # Step 8: Fix strange characters
+        print("  8. Fixing strange characters...")
+        lines = self.fix_strange_characters(lines)
+        temp_file_8 = os.path.join(temp_dir, f"temp_08_strange_characters_{base_filename}.md")
         self.write_file(lines, temp_file_8)
         print(f"     Temporal file saved: {temp_file_8}")
         
-        # Step 9: Fix excessive whitespace (final step)
-        print("  9. Fixing excessive whitespace...")
-        lines = self.fix_excessive_whitespace(lines)
-        temp_file_9 = os.path.join(temp_dir, f"temp_09_excessive_whitespace_{base_filename}.md")
+        # Step 9: Apply batch newline processing
+        print("  9. Applying batch newline processing...")
+        lines = self.fix_newlines_batch_processing(lines)
+        temp_file_9 = os.path.join(temp_dir, f"temp_09_batch_newlines_{base_filename}.md")
         self.write_file(lines, temp_file_9)
         print(f"     Temporal file saved: {temp_file_9}")
+        
+        # Step 10: Fix excessive whitespace (final step)
+        print("  10. Fixing excessive whitespace...")
+        lines = self.fix_excessive_whitespace(lines)
+        temp_file_10 = os.path.join(temp_dir, f"temp_10_excessive_whitespace_{base_filename}.md")
+        self.write_file(lines, temp_file_10)
+        print(f"     Temporal file saved: {temp_file_10}")
         
         print(f"Fixed file has {len(lines)} lines")
         
@@ -1240,6 +1367,7 @@ class PDFToMarkdownProcessor:
         print(f"  - {temp_file_7}")
         print(f"  - {temp_file_8}")
         print(f"  - {temp_file_9}")
+        print(f"  - {temp_file_10}")
         
         return True
     
