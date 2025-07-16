@@ -55,7 +55,12 @@ class PDFToMarkdownProcessor:
             'article_quote_prefix_fixes': 0,
             'reference_hashtag_fixes': 0,
             'article_hierarchy_fixes': 0,
-            'incorrect_five_hashtag_fixes': 0
+            'incorrect_five_hashtag_fixes': 0,
+            'malformed_article_headers': 0,
+            'comprehensive_article_fixes': 0,
+            'final_character_cleanup': 0,
+            'double_accent_fixes': 0,
+            'paragraph_fixes': 0
         }
     
     def generate_filename_from_path(self, file_path: str) -> str:
@@ -1071,6 +1076,211 @@ class PDFToMarkdownProcessor:
         
         return step5_valid and step6_valid
     
+    def detect_context_section(self, lines: List[str], current_index: int) -> str:
+        """Detect which section context we're in - improved logic"""
+        # Look backwards to find the most recent section context
+        last_reference_section = None
+        last_main_section = None
+        
+        for i in range(current_index - 1, max(0, current_index - 50), -1):
+            line = lines[i].strip()
+            
+            # Check for explicit reference section headers (most recent)
+            if re.search(r'####\s*Disposiciones\s+Relacionadas', line, re.IGNORECASE):
+                last_reference_section = i
+                break
+            elif re.search(r'####\s*Nota\s+del\s+Editor', line, re.IGNORECASE):
+                last_reference_section = i
+                break
+            
+            # Check for main content indicators that would end reference sections
+            elif re.search(r'^##\s+(CAPÍTULO|SECCIÓN|TÍTULO)', line, re.IGNORECASE):
+                last_main_section = i
+                break
+            elif re.search(r'^###\s+ARTÍCULO\s+\d+\.-', line, re.IGNORECASE):
+                last_main_section = i
+                break
+            
+            # Look for patterns that clearly indicate main content
+            elif re.search(r'^(OBJETO|SUJETOS|NACIMIENTO|BASE\s+IMPONIBLE)', line, re.IGNORECASE):
+                last_main_section = i
+                break
+        
+        # Now check if there's any main content indicator between the reference section and current line
+        if last_reference_section is not None:
+            # Look for main content indicators between the reference section and current line
+            for i in range(last_reference_section + 1, current_index):
+                line = lines[i].strip()
+                
+                # If we find a main article or major section after the reference section, we're back in main content
+                if (re.search(r'^###\s+ARTÍCULO\s+\d+\.-', line, re.IGNORECASE) or
+                    re.search(r'^##\s+(CAPÍTULO|SECCIÓN|TÍTULO)', line, re.IGNORECASE) or
+                    re.search(r'^(OBJETO|SUJETOS|NACIMIENTO|BASE\s+IMPONIBLE)', line, re.IGNORECASE)):
+                    return 'main'
+            
+            # If no main content found after reference section, we're still in reference context
+            return 'disposiciones'
+        
+        # Default to main if no reference section found
+        return 'main'
+
+    def fix_article_hashtag_levels(self, lines: List[str]) -> List[str]:
+        """Fix article hashtag levels based on context - main articles get ###, reference articles get ####"""
+        fixed_lines = []
+        
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+            
+            # Match various article patterns - including articles without hashtags
+            patterns = [
+                r'^(#+)\s*ARTÍCULO\s+(\d+)\.-\s*(.*)',  # Standard format with hashtags
+                r'^(#+)\s*ARTÍCULO\s+(\d+)\.\s*(.*)',   # With period instead of dash
+                r'^(#+)\s*\'?\s*ARTÍCULO\s+(\d+)\.-\s*(.*)',  # With quote prefix
+                r'^ARTÍCULO\s+(\d+)\.-\s*(.*)',  # Without hashtags - standard format
+                r'^ARTÍCULO\s+(\d+)\.\s*(.*)',   # Without hashtags - period format
+                r'^ARTCULO\s+(\d+)\.-\s*(.*)',   # Without hashtags - missing accent
+            ]
+            
+            article_match = None
+            has_hashtags = False
+            
+            for pattern in patterns:
+                match = re.search(pattern, line_stripped, re.IGNORECASE)
+                if match:
+                    article_match = match
+                    # Check if this pattern includes hashtags
+                    has_hashtags = pattern.startswith(r'^(#+)')
+                    break
+            
+            if article_match:
+                if has_hashtags:
+                    current_hashtag_level = len(article_match.group(1))
+                    article_number = int(article_match.group(2))
+                    article_title = article_match.group(3).strip() if len(article_match.groups()) > 2 else ""
+                else:
+                    current_hashtag_level = 0  # No hashtags
+                    article_number = int(article_match.group(1))
+                    article_title = article_match.group(2).strip() if len(article_match.groups()) > 1 else ""
+                
+                # Determine if this is a true reference article or should be a main article
+                is_reference = self.is_true_reference_article(lines, i, article_number)
+                
+                if is_reference:
+                    # Reference articles in special sections get ####
+                    correct_hashtags = "####"
+                    new_line = f"{correct_hashtags} ARTÍCULO {article_number}.- {article_title}\n"
+                else:
+                    # Main articles get ###
+                    correct_hashtags = "###"
+                    new_line = f"{correct_hashtags} ARTÍCULO {article_number}.- {article_title}\n"
+                
+                fixed_lines.append(new_line)
+                
+                if current_hashtag_level != len(correct_hashtags):
+                    self.fixes_applied['article_hierarchy_fixes'] += 1
+            else:
+                fixed_lines.append(line)
+        
+        return fixed_lines
+    
+    def is_true_reference_article(self, lines: List[str], current_index: int, article_number: int) -> bool:
+        """Determine if an article is truly a reference article based on specific patterns"""
+        
+        # Look backwards to find the most recent context - be more specific
+        for i in range(current_index - 1, max(0, current_index - 8), -1):
+            line = lines[i].strip()
+            
+            # If we find "Disposiciones Relacionadas" very close (within 8 lines), it's a reference
+            if re.search(r'####\s*Disposiciones\s+Relacionadas', line, re.IGNORECASE):
+                return True
+            
+            # If we find "Nota del Editor" very close (within 8 lines), it's a reference
+            if re.search(r'####\s*Nota\s+del\s+Editor', line, re.IGNORECASE):
+                return True
+            
+            # If we find a main section or main article, stop looking - this is main content
+            if (re.search(r'^##\s+(CAPÍTULO|SECCIÓN)', line, re.IGNORECASE) or
+                re.search(r'^###\s+ARTÍCULO\s+\d+\.-', line, re.IGNORECASE)):
+                return False
+        
+        # Additional check: Look for substantial content after the article
+        # Main articles typically have substantial content, reference articles have minimal content
+        content_lines = 0
+        substantial_content = False
+        
+        for i in range(current_index + 1, min(current_index + 15, len(lines))):
+            line = lines[i].strip()
+            
+            # Skip empty lines and short lines
+            if not line or len(line) < 10:
+                continue
+                
+            # Skip lines that start with hashtags (next sections)
+            if line.startswith('#'):
+                break
+                
+            # Skip lines that are just references to laws
+            if re.search(r'^Ley N°|^Decreto Supremo', line, re.IGNORECASE):
+                continue
+            
+            content_lines += 1
+            
+            # Look for patterns that indicate substantial article content
+            if (re.search(r'^\(.*\)\.\s*[A-Z]', line) or  # Article content with parentheses
+                re.search(r'^\d+\.\s+', line) or  # Numbered lists
+                len(line) > 50):  # Long content lines
+                substantial_content = True
+        
+        # If we have substantial content (more than 3 content lines or clear substantial content), it's a main article
+        if content_lines > 3 or substantial_content:
+            return False
+        
+        # Default: assume it's a main article unless we have strong evidence it's a reference
+        return False
+    
+    def is_reference_article(self, lines: List[str], current_index: int, article_number: int) -> bool:
+        """Determine if an article is a reference article or main article based on context and patterns"""
+        
+        # Look backwards to find the most recent section context
+        for i in range(current_index - 1, max(0, current_index - 20), -1):
+            line = lines[i].strip()
+            
+            # If we find a reference section header very close (within 20 lines), check if it's truly a reference
+            if re.search(r'####\s*Disposiciones\s+Relacionadas', line, re.IGNORECASE):
+                # This is definitely a reference article
+                return True
+            elif re.search(r'####\s*Nota\s+del\s+Editor', line, re.IGNORECASE):
+                # Check if there's any main content between the Nota del Editor and current article
+                for j in range(i + 1, current_index):
+                    check_line = lines[j].strip()
+                    # If we find main content indicators, this is not a reference article
+                    if (re.search(r'^###\s+ARTÍCULO\s+\d+\.-', check_line, re.IGNORECASE) or
+                        re.search(r'^##\s+(CAPÍTULO|SECCIÓN)', check_line, re.IGNORECASE) or
+                        re.search(r'^\(.*\)\.\s*[A-Z]', check_line) or  # Article content pattern
+                        len(check_line) > 50):  # Substantial content
+                        return False
+                # If no main content found between Nota del Editor and article, it might be a reference
+                # But let's be more specific - only if it's very close (within 5 lines)
+                return (current_index - i) <= 5
+            
+            # If we find a main section header, this is definitely a main article
+            elif re.search(r'^##\s+(CAPÍTULO|SECCIÓN|TÍTULO)', line, re.IGNORECASE):
+                return False
+            elif re.search(r'^###\s+ARTÍCULO\s+\d+\.-', line, re.IGNORECASE):
+                return False
+        
+        # Additional heuristic: Articles that are clearly part of main content flow
+        # Look for content patterns that indicate this is a main article
+        for i in range(current_index + 1, min(current_index + 10, len(lines))):
+            line = lines[i].strip()
+            # If we find substantial content after the article, it's likely a main article
+            if (re.search(r'^\(.*\)\.\s*[A-Z]', line) or  # Article content with parentheses
+                (len(line) > 30 and not line.startswith('#') and not line.startswith('Ley N°'))):
+                return False
+        
+        # Default: assume it's a main article unless we have strong evidence it's a reference
+        return False
+
     def fix_new_requirements(self, lines: List[str]) -> List[str]:
         """Fix issues based on new requirements"""
         fixed_lines = []
@@ -1091,20 +1301,6 @@ class PDFToMarkdownProcessor:
                 in_nota_del_editor = True
                 in_disposiciones_relacionadas = False
                 fixed_lines.append(line)
-                i += 1
-                continue
-            elif re.search(r'^###\s+ARTÍCULO\s+\d+', line, re.IGNORECASE):
-                # Check if this is a main article (sequential) or a reference article
-                if in_disposiciones_relacionadas or in_nota_del_editor:
-                    # This is a reference article, should have 4 hashtags
-                    article_content = re.sub(r'^###\s*', '', line.strip())
-                    fixed_lines.append(f"#### {article_content}\n")
-                    self.fixes_applied['article_hierarchy_fixes'] += 1
-                else:
-                    # This is a main article, keep 3 hashtags and exit reference sections
-                    in_disposiciones_relacionadas = False
-                    in_nota_del_editor = False
-                    fixed_lines.append(line)
                 i += 1
                 continue
             elif re.search(r'^##\s+(SECCIÓN|CAPÍTULO|TÍTULO)', line, re.IGNORECASE):
@@ -1485,6 +1681,195 @@ class PDFToMarkdownProcessor:
         
         return fixed_lines
 
+    def fix_malformed_article_headers(self, lines: List[str]) -> List[str]:
+        """Fix malformed article headers where title is on a new line"""
+        fixed_lines = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            header_match = re.match(r'^(#+\s*ARTÍCULO\s+\d+\.-)\s*$', line.strip())
+            if header_match:
+                # Look ahead for the title
+                j = i + 1
+                title_found = False
+                while j < len(lines) and j < i + 5: # Look ahead up to 4 lines
+                    next_line = lines[j].strip()
+                    if not next_line or next_line == '-':
+                        j += 1
+                        continue
+                    
+                    # Updated regex to capture title and optional body
+                    title_match = re.match(r'^-?\s*(\(.*?\))(?:\.\s*(.*))?$', next_line)
+
+                    if title_match:
+                        title = title_match.group(1)
+                        body = title_match.group(2)
+                        
+                        # Combine header and title
+                        new_line = f"{header_match.group(1).strip()} {title}\n"
+                        fixed_lines.append(new_line)
+                        
+                        # If there was a body, add it on a new line after a blank line
+                        if body and body.strip():
+                            fixed_lines.append('\n')
+                            fixed_lines.append(f"{body.strip()}\n")
+                        
+                        self.fixes_applied['malformed_article_headers'] += 1
+                        i = j + 1
+                        title_found = True
+                        break
+                    else:
+                        # This is not the pattern we are looking for, so stop looking ahead.
+                        break
+                
+                if not title_found:
+                    fixed_lines.append(line)
+                    i += 1
+            else:
+                fixed_lines.append(line)
+                i += 1
+                
+        return fixed_lines
+
+    def apply_comprehensive_article_fixes(self, lines: List[str]) -> List[str]:
+        """Apply comprehensive fixes to article headers."""
+        fixed_lines = []
+        for line in lines:
+            original_line = line
+            # Fix double hashtags like ### ###
+            line = re.sub(r'^(#+)\s\1\s', r'\1 ', line)
+            # Fix patterns like `).-`
+            line = re.sub(r'\s*\)\s*\.\s*-\s*$', ').-', line.rstrip()) + '\n'
+            # Fix patterns like `..-`
+            line = re.sub(r'\.\.-$', '.-', line.rstrip()) + '\n'
+            
+            if original_line != line:
+                self.fixes_applied['comprehensive_article_fixes'] += 1
+            fixed_lines.append(line)
+        return fixed_lines
+
+    def fix_double_accents(self, lines: List[str]) -> List[str]:
+        """Fix double accents"""
+        fixed_lines = []
+        for line in lines:
+            original_line = line
+            line = line.replace('ÁÁ', 'Á')
+            if original_line != line:
+                self.fixes_applied['double_accent_fixes'] += 1
+            fixed_lines.append(line)
+        return fixed_lines
+
+    def is_new_paragraph(self, line: str, prev_line: str) -> bool:
+        """Heuristics to decide if a line starts a new paragraph."""
+        stripped_line = line.strip()
+        if not stripped_line:
+            return False
+
+        # If the previous line was blank, this is a new paragraph
+        if not prev_line.strip():
+            return True
+
+        # Structural elements (case-insensitive)
+        if re.match(r'^(Artículo|Articulo|ARTÍCULO|ARTICULO|CAPITULO|CAPÍTULO|TITULO|TÍTULO|DISPOSICI[OÓ]N|PARÁGRAFO|PARAGRAFO)', stripped_line, re.IGNORECASE):
+            return True
+
+        # List items
+        if re.match(r'^\s*-\s+', stripped_line):
+            return True
+        if re.match(r'^\s*[IVXLCDM]+\.', stripped_line):  # Roman numerals (I., II., etc.)
+            return True
+        if re.match(r'^\s*\d+\.', stripped_line):  # Ordered list (1., 2., etc.)
+            return True
+        if re.match(r'^\s*[a-z]\)', stripped_line):  # Ordered list (a), b), etc.)
+            return True
+
+        # Special lines
+        if stripped_line.startswith('Nota del Editor'):
+            return True
+            
+        # Contextual: previous line ended a sentence and this one starts with uppercase
+        if prev_line.strip().endswith(('.', '!', '?', ':', ';', ')', '"', '”')) and stripped_line and stripped_line[0].isupper():
+            return True
+
+        return False
+
+    def fix_document_paragraphs(self, lines: List[str]) -> List[str]:
+        """
+        Identifies paragraph breaks, marks them, then joins everything else.
+        """
+        text = "".join(lines)
+        original_text = text
+        
+        lines_in = text.split('\n')
+        
+        PARA_BREAK = "___PARA_BREAK___"
+        
+        # First pass: insert break markers
+        marked_lines = []
+        prev_line = ""
+        for line in lines_in:
+            # An empty line is a paragraph break
+            if not line.strip():
+                # Avoid multiple consecutive breaks
+                if marked_lines and marked_lines[-1] != PARA_BREAK:
+                    marked_lines.append(PARA_BREAK)
+                prev_line = ""
+                continue
+
+            if self.is_new_paragraph(line, prev_line):
+                if marked_lines and marked_lines[-1] != PARA_BREAK:
+                     marked_lines.append(PARA_BREAK)
+            
+            marked_lines.append(line)
+            prev_line = line
+
+        # Second pass: join and clean
+        full_text = '\n'.join(marked_lines)
+        paragraphs = full_text.split(PARA_BREAK)
+        
+        cleaned_paragraphs = []
+        for p in paragraphs:
+            # Replace newlines and multiple spaces with a single space
+            cleaned = re.sub(r'\s+', ' ', p).strip()
+            if cleaned:
+                cleaned_paragraphs.append(cleaned)
+                
+        fixed_text = '\n\n'.join(cleaned_paragraphs)
+        
+        if fixed_text != original_text:
+            self.fixes_applied['paragraph_fixes'] += 1
+            
+        return (fixed_text + '\n').splitlines(True)
+
+    def apply_final_character_cleanup(self, lines: List[str]) -> List[str]:
+        """Apply final character cleanup."""
+        fixed_lines = []
+        for line in lines:
+            original_line = line
+            replacements = {
+                'ÁÁ': 'Á', 'ÉÉ': 'É', 'ÍÍ': 'Í', 'ÓÓ': 'Ó', 'ÚÚ': 'Ú',
+                'áá': 'á', 'éé': 'é', 'íí': 'í', 'óó': 'ó', 'úú': 'ú',
+                'ÑÑ': 'Ñ', 'ññ': 'ñ',
+                'disposiciónes': 'disposiciones',
+                'naciónal': 'nacional',
+                'internaciónales': 'internacionales',
+                'Internaciónales': 'Internacionales',
+                'ARTCULO': 'ARTÍCULO',
+                'MBITO': 'ÁMBITO',
+                'APLICACIN': 'APLICACIÓN',
+                'Cdigo': 'Código',
+                'rgimen': 'régimen',
+                'jurdico': 'jurídico',
+                'carcter': 'carácter'
+            }
+            for bad, good in replacements.items():
+                line = line.replace(bad, good)
+                
+            if original_line != line:
+                self.fixes_applied['final_character_cleanup'] += 1
+            fixed_lines.append(line)
+        return fixed_lines
+
     def apply_markdown_fixes(self, file_path: str) -> bool:
         """Apply all markdown fixes to the file with temporal file generation"""
         print(f"Applying markdown fixes to: {file_path}")
@@ -1539,56 +1924,98 @@ class PDFToMarkdownProcessor:
         self.write_file(lines, temp_file_4)
         print(f"     Temporal file saved: {temp_file_4}")
         
-        # Step 5: Fix new requirements
-        print("  5. Fixing new requirements...")
-        lines = self.fix_new_requirements(lines)
-        temp_file_5 = os.path.join(temp_dir, f"temp_05_new_requirements_{base_filename}.md")
+        # Step 5: Fix article hashtag levels (NEW STEP)
+        print("  5. Fixing article hashtag levels...")
+        lines = self.fix_article_hashtag_levels(lines)
+        temp_file_5 = os.path.join(temp_dir, f"temp_05_article_hashtags_{base_filename}.md")
         self.write_file(lines, temp_file_5)
         print(f"     Temporal file saved: {temp_file_5}")
         
-        # Step 6: Fix table and INDICE issues (NEW STEP)
-        print("  6. Fixing table and INDICE issues...")
-        lines = self.fix_table_and_indice_issues(lines)
-        temp_file_6 = os.path.join(temp_dir, f"temp_06_table_indice_{base_filename}.md")
+        # Step 6: Fix new requirements
+        print("  6. Fixing new requirements...")
+        lines = self.fix_new_requirements(lines)
+        temp_file_6 = os.path.join(temp_dir, f"temp_06_new_requirements_{base_filename}.md")
         self.write_file(lines, temp_file_6)
         print(f"     Temporal file saved: {temp_file_6}")
         
-        # VALIDATION: Compare article numbers between Step 5 and Step 6
-        print("\n  VALIDATION: Checking article sequence between Step 5 and Step 6...")
-        validation_result = self.compare_article_numbers_between_steps(temp_file_5, temp_file_6)
+        # Step 7: Fix table and INDICE issues
+        print("  7. Fixing table and INDICE issues...")
+        lines = self.fix_table_and_indice_issues(lines)
+        temp_file_7 = os.path.join(temp_dir, f"temp_07_table_indice_{base_filename}.md")
+        self.write_file(lines, temp_file_7)
+        print(f"     Temporal file saved: {temp_file_7}")
+        
+        # VALIDATION: Compare article numbers between Step 6 and Step 7
+        print("\n  VALIDATION: Checking article sequence between Step 6 and Step 7...")
+        validation_result = self.compare_article_numbers_between_steps(temp_file_6, temp_file_7)
         if not validation_result:
             print("    WARNING: Article sequence validation failed!")
             print("    Consider reviewing the article numbering in the output files.")
         else:
             print("    ✓ Article sequence validation passed!")
         
-        # Step 7: Fix scattered letters
-        print("  7. Fixing scattered letters...")
+        # Step 8: Fix scattered letters
+        print("  8. Fixing scattered letters...")
         lines = self.fix_scattered_letters(lines)
-        temp_file_7 = os.path.join(temp_dir, f"temp_07_scattered_letters_{base_filename}.md")
-        self.write_file(lines, temp_file_7)
-        print(f"     Temporal file saved: {temp_file_7}")
-        
-        # Step 8: Fix strange characters
-        print("  8. Fixing strange characters...")
-        lines = self.fix_strange_characters(lines)
-        temp_file_8 = os.path.join(temp_dir, f"temp_08_strange_characters_{base_filename}.md")
+        temp_file_8 = os.path.join(temp_dir, f"temp_08_scattered_letters_{base_filename}.md")
         self.write_file(lines, temp_file_8)
         print(f"     Temporal file saved: {temp_file_8}")
         
-        # Step 9: Apply batch newline processing
-        print("  9. Applying batch newline processing...")
-        lines = self.fix_newlines_batch_processing(lines)
-        temp_file_9 = os.path.join(temp_dir, f"temp_09_batch_newlines_{base_filename}.md")
+        # Step 9: Fix strange characters
+        print("  9. Fixing strange characters...")
+        lines = self.fix_strange_characters(lines)
+        temp_file_9 = os.path.join(temp_dir, f"temp_09_strange_characters_{base_filename}.md")
         self.write_file(lines, temp_file_9)
         print(f"     Temporal file saved: {temp_file_9}")
         
-        # Step 10: Fix excessive whitespace (final step)
-        print("  10. Fixing excessive whitespace...")
-        lines = self.fix_excessive_whitespace(lines)
-        temp_file_10 = os.path.join(temp_dir, f"temp_10_excessive_whitespace_{base_filename}.md")
+        # Step 10: Apply batch newline processing
+        print("  10. Applying batch newline processing...")
+        lines = self.fix_newlines_batch_processing(lines)
+        temp_file_10 = os.path.join(temp_dir, f"temp_10_batch_newlines_{base_filename}.md")
         self.write_file(lines, temp_file_10)
         print(f"     Temporal file saved: {temp_file_10}")
+        
+        # Step 11: Fix malformed article headers (NEW)
+        print("  11. Fixing malformed article headers...")
+        lines = self.fix_malformed_article_headers(lines)
+        temp_file_11 = os.path.join(temp_dir, f"temp_11_article_headers_{base_filename}.md")
+        self.write_file(lines, temp_file_11)
+        print(f"     Temporal file saved: {temp_file_11}")
+        
+        # Step 12: Apply comprehensive article fixes (NEW)
+        print("  12. Applying comprehensive article fixes...")
+        lines = self.apply_comprehensive_article_fixes(lines)
+        temp_file_12 = os.path.join(temp_dir, f"temp_12_comprehensive_articles_{base_filename}.md")
+        self.write_file(lines, temp_file_12)
+        print(f"     Temporal file saved: {temp_file_12}")
+        
+        # Step 13: Apply final character cleanup (NEW)
+        print("  13. Applying final character cleanup...")
+        lines = self.apply_final_character_cleanup(lines)
+        temp_file_13 = os.path.join(temp_dir, f"temp_13_final_characters_{base_filename}.md")
+        self.write_file(lines, temp_file_13)
+        print(f"     Temporal file saved: {temp_file_13}")
+
+        # Step 14: Fix double accents (NEW)
+        print("  14. Fixing double accents...")
+        lines = self.fix_double_accents(lines)
+        temp_file_14 = os.path.join(temp_dir, f"temp_14_double_accents_{base_filename}.md")
+        self.write_file(lines, temp_file_14)
+        print(f"     Temporal file saved: {temp_file_14}")
+        
+        # Step 15: Fix paragraphs
+        print("  15. Fixing paragraphs...")
+        lines = self.fix_document_paragraphs(lines)
+        temp_file_15 = os.path.join(temp_dir, f"temp_15_paragraphs_{base_filename}.md")
+        self.write_file(lines, temp_file_15)
+        print(f"     Temporal file saved: {temp_file_15}")
+
+        # Step 16: Fix excessive whitespace (final step)
+        print("  16. Fixing excessive whitespace...")
+        lines = self.fix_excessive_whitespace(lines)
+        temp_file_16 = os.path.join(temp_dir, f"temp_16_excessive_whitespace_{base_filename}.md")
+        self.write_file(lines, temp_file_16)
+        print(f"     Temporal file saved: {temp_file_16}")
         
         print(f"Fixed file has {len(lines)} lines")
         
@@ -1619,6 +2046,12 @@ class PDFToMarkdownProcessor:
         print(f"  - {temp_file_8}")
         print(f"  - {temp_file_9}")
         print(f"  - {temp_file_10}")
+        print(f"  - {temp_file_11}")
+        print(f"  - {temp_file_12}")
+        print(f"  - {temp_file_13}")
+        print(f"  - {temp_file_14}")
+        print(f"  - {temp_file_15}")
+        print(f"  - {temp_file_16}")
         
         return True
     
