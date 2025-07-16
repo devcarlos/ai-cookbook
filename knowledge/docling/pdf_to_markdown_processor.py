@@ -342,6 +342,8 @@ class PDFToMarkdownProcessor:
         fixed_lines = []
         i = 0
         in_table_section = False
+        in_disposiciones_relacionadas = False
+        in_nota_del_editor = False
         
         while i < len(lines):
             line = lines[i]
@@ -368,6 +370,48 @@ class PDFToMarkdownProcessor:
                     self.fixes_applied['incorrect_hashtags'] += 1
                 else:
                     fixed_lines.append(line)
+                i += 1
+                continue
+            
+            # Track if we're in Disposiciones Relacionadas or Nota del Editor sections
+            if re.search(r'\bDisposiciones\s+Relacionadas\s*:', clean_line, re.IGNORECASE):
+                in_disposiciones_relacionadas = True
+                in_nota_del_editor = False
+                fixed_lines.append(f"#### {clean_line}\n")
+                self.fixes_applied['header_hierarchy'] += 1
+                i += 1
+                continue
+            
+            if re.search(r'\bNota\s+del\s+Editor\s*:', clean_line, re.IGNORECASE):
+                in_nota_del_editor = True
+                in_disposiciones_relacionadas = False
+                fixed_lines.append(f"#### {clean_line}\n")
+                self.fixes_applied['header_hierarchy'] += 1
+                i += 1
+                continue
+            
+            # Exit reference sections when we encounter a new main article or major section
+            if re.search(r'^ARTÍCULO\s+\d+\.\s*[A-Z]', clean_line, re.IGNORECASE) or re.search(r'^(SUJETOS|NACIMIENTO|BASE\s+IMPONIBLE|CAPÍTULO)', clean_line, re.IGNORECASE):
+                in_disposiciones_relacionadas = False
+                in_nota_del_editor = False
+            
+            # FIX 1: Handle title order issue - fix "843 LEY N°" to "LEY N° 843"
+            title_order_match = re.search(r'^(\d+)\s+(LEY\s+N°)\s*$', clean_line, re.IGNORECASE)
+            if title_order_match:
+                number = title_order_match.group(1)
+                ley_part = title_order_match.group(2)
+                corrected_title = f"{ley_part} {number}"
+                if line.strip().startswith('#'):
+                    # Preserve the hashtag level
+                    hashtag_match = re.match(r'^(#+)\s*', line)
+                    if hashtag_match:
+                        hashtag_level = hashtag_match.group(1)
+                        fixed_lines.append(f"{hashtag_level} {corrected_title}\n")
+                    else:
+                        fixed_lines.append(f"# {corrected_title}\n")
+                else:
+                    fixed_lines.append(f"# {corrected_title}\n")
+                self.fixes_applied['header_hierarchy'] += 1
                 i += 1
                 continue
             
@@ -413,12 +457,30 @@ class PDFToMarkdownProcessor:
                 i += 1
                 continue
             
-            article_match = re.search(r'\bARTÍCULO\s+\d+.*?\)\.\s*(.*)', clean_line, re.IGNORECASE)
-            if article_match:
-                article_header = clean_line[:article_match.start(1)].strip()
-                article_content = article_match.group(1).strip()
+            # Handle different article patterns
+            # Pattern 1: "ARTÍCULO 1.Créase en" -> "### ARTÍCULO 1.-" + content
+            article_match1 = re.search(r'\b(ARTÍCULO\s+\d+)\.(.+)', clean_line, re.IGNORECASE)
+            # Pattern 2: "ARTÍCULO 2.A los fines" -> "### ARTÍCULO 2.-" + content  
+            article_match2 = re.search(r'\b(ARTÍCULO\s+\d+)\.([A-Z].+)', clean_line, re.IGNORECASE)
+            # Pattern 3: Standard format with parentheses "ARTÍCULO 1.- (OBJETO)."
+            article_match3 = re.search(r'\b(ARTÍCULO\s+\d+.*?\)\.\s*)(.*)', clean_line, re.IGNORECASE)
+            
+            if article_match1 or article_match2:
+                # Handle patterns where article number is followed by period and immediate content
+                match = article_match1 or article_match2
+                article_number = match.group(1).strip()
+                article_content = match.group(2).strip()
                 
-                fixed_lines.append(f"### {article_header}\n")
+                # Format as "### ARTÍCULO X.-" or "#### ARTÍCULO X.-" depending on context
+                article_header = f"{article_number}.-"
+                
+                # Use 4 hashtags if we're in a reference section, 3 otherwise
+                if in_disposiciones_relacionadas or in_nota_del_editor:
+                    fixed_lines.append(f"#### {article_header}\n")
+                else:
+                    fixed_lines.append(f"### {article_header}\n")
+                
+                fixed_lines.append(f"\n")  # Add blank line
                 
                 if article_content:
                     fixed_lines.append(f"{article_content}\n")
@@ -426,16 +488,23 @@ class PDFToMarkdownProcessor:
                 self.fixes_applied['article_formatting'] += 1
                 i += 1
                 continue
-            
-            if re.search(r'\bDisposiciones\s+Relacionadas\s*:', clean_line, re.IGNORECASE):
-                fixed_lines.append(f"#### {clean_line}\n")
-                self.fixes_applied['header_hierarchy'] += 1
-                i += 1
-                continue
-            
-            if re.search(r'\bNota\s+del\s+Editor\s*:', clean_line, re.IGNORECASE):
-                fixed_lines.append(f"#### {clean_line}\n")
-                self.fixes_applied['header_hierarchy'] += 1
+            elif article_match3:
+                # Handle standard format with parentheses
+                article_header = article_match3.group(1).strip()
+                article_content = article_match3.group(2).strip()
+                
+                # Use 4 hashtags if we're in a reference section, 3 otherwise
+                if in_disposiciones_relacionadas or in_nota_del_editor:
+                    fixed_lines.append(f"#### {article_header}\n")
+                else:
+                    fixed_lines.append(f"### {article_header}\n")
+                
+                fixed_lines.append(f"\n")  # Add blank line
+                
+                if article_content:
+                    fixed_lines.append(f"{article_content}\n")
+                
+                self.fixes_applied['article_formatting'] += 1
                 i += 1
                 continue
             
@@ -870,6 +939,138 @@ class PDFToMarkdownProcessor:
         
         return True
     
+    def extract_article_numbers(self, lines: List[str]) -> List[Tuple[int, int, str]]:
+        """Extract article numbers from lines. Returns list of (line_number, article_number, full_line)"""
+        articles = []
+        for i, line in enumerate(lines):
+            # Match patterns like "### ARTÍCULO 1.-" or "#### ARTÍCULO 54.-"
+            match = re.search(r'^#+\s*ARTÍCULO\s+(\d+)\.-', line.strip(), re.IGNORECASE)
+            if match:
+                article_num = int(match.group(1))
+                articles.append((i + 1, article_num, line.strip()))
+        return articles
+    
+    def validate_article_sequence(self, articles: List[Tuple[int, int, str]]) -> Tuple[bool, List[str]]:
+        """Validate that main articles (### level) are sequential. Returns (is_valid, issues)"""
+        if not articles:
+            return True, []
+        
+        issues = []
+        main_articles = []
+        reference_articles = []
+        
+        # Separate main articles (###) from reference articles (#### or #####)
+        for line_num, article_num, full_line in articles:
+            if full_line.startswith('###'):
+                main_articles.append((line_num, article_num, full_line))
+            else:
+                reference_articles.append((line_num, article_num, full_line))
+        
+        # Check main articles for sequential numbering (only ### level articles)
+        if main_articles:
+            expected_num = 1
+            for line_num, article_num, full_line in main_articles:
+                if article_num != expected_num:
+                    issues.append(f"Line {line_num}: Expected main ARTÍCULO {expected_num}, found ARTÍCULO {article_num}")
+                expected_num += 1
+        
+        # Reference articles (#### level) can have any number - they are references within main articles
+        # No validation needed for reference articles as they can reference any article number
+        
+        return len(issues) == 0, issues
+    
+    def fix_article_sequence(self, lines: List[str]) -> List[str]:
+        """Fix article sequence to be correlative"""
+        fixed_lines = []
+        article_counter = 1
+        
+        for line in lines:
+            # Check if this is a main article line (### level)
+            match = re.search(r'^(###\s*ARTÍCULO\s+)\d+(\.-.*)', line.strip(), re.IGNORECASE)
+            if match:
+                prefix = match.group(1)
+                suffix = match.group(2)
+                # Replace with sequential number
+                new_line = f"{prefix}{article_counter}{suffix}\n"
+                fixed_lines.append(new_line)
+                article_counter += 1
+                self.fixes_applied['article_formatting'] += 1
+            else:
+                fixed_lines.append(line)
+        
+        return fixed_lines
+    
+    def compare_article_numbers_between_steps(self, step5_file: str, step6_file: str) -> bool:
+        """Compare article numbers between Step 5 and Step 6 files"""
+        print("    Validating article sequence between Step 5 and Step 6...")
+        
+        # Read both files
+        step5_lines = self.read_file(step5_file)
+        step6_lines = self.read_file(step6_file)
+        
+        if not step5_lines or not step6_lines:
+            print("    Warning: Could not read step files for validation")
+            return False
+        
+        # Extract articles from both steps
+        step5_articles = self.extract_article_numbers(step5_lines)
+        step6_articles = self.extract_article_numbers(step6_lines)
+        
+        # Separate main articles (###) from reference articles (####)
+        step5_main = [(ln, an, fl) for ln, an, fl in step5_articles if fl.startswith('###')]
+        step5_ref = [(ln, an, fl) for ln, an, fl in step5_articles if fl.startswith('####')]
+        step6_main = [(ln, an, fl) for ln, an, fl in step6_articles if fl.startswith('###')]
+        step6_ref = [(ln, an, fl) for ln, an, fl in step6_articles if fl.startswith('####')]
+        
+        print(f"    Step 5: Found {len(step5_main)} main articles (###) and {len(step5_ref)} reference articles (####)")
+        print(f"    Step 6: Found {len(step6_main)} main articles (###) and {len(step6_ref)} reference articles (####)")
+        
+        # Validate Step 5 sequence (only main articles need to be sequential)
+        step5_valid, step5_issues = self.validate_article_sequence(step5_articles)
+        if not step5_valid:
+            print("    Step 5 main article sequence issues:")
+            for issue in step5_issues[:5]:  # Show first 5 issues
+                print(f"      - {issue}")
+            if len(step5_issues) > 5:
+                print(f"      ... and {len(step5_issues) - 5} more issues")
+        else:
+            print("    Step 5: Main articles are correctly sequential ✓")
+        
+        # Validate Step 6 sequence (only main articles need to be sequential)
+        step6_valid, step6_issues = self.validate_article_sequence(step6_articles)
+        if not step6_valid:
+            print("    Step 6 main article sequence issues:")
+            for issue in step6_issues[:5]:  # Show first 5 issues
+                print(f"      - {issue}")
+            if len(step6_issues) > 5:
+                print(f"      ... and {len(step6_issues) - 5} more issues")
+        else:
+            print("    Step 6: Main articles are correctly sequential ✓")
+        
+        # Compare article counts
+        if len(step5_articles) != len(step6_articles):
+            print(f"    WARNING: Total article count changed from Step 5 ({len(step5_articles)}) to Step 6 ({len(step6_articles)})")
+        
+        if len(step5_main) != len(step6_main):
+            print(f"    WARNING: Main article count changed from Step 5 ({len(step5_main)}) to Step 6 ({len(step6_main)})")
+        
+        # Show first few main articles from each step for comparison
+        print("    First 10 main articles (###) in Step 5:")
+        for i, (line_num, article_num, full_line) in enumerate(step5_main[:10]):
+            print(f"      Line {line_num}: ### ARTÍCULO {article_num}")
+        
+        print("    First 10 main articles (###) in Step 6:")
+        for i, (line_num, article_num, full_line) in enumerate(step6_main[:10]):
+            print(f"      Line {line_num}: ### ARTÍCULO {article_num}")
+        
+        # Show some reference articles as examples (they can have any number)
+        if step5_ref:
+            print("    Example reference articles (####) in Step 5 (can have any number):")
+            for i, (line_num, article_num, full_line) in enumerate(step5_ref[:5]):
+                print(f"      Line {line_num}: #### ARTÍCULO {article_num} (reference)")
+        
+        return step5_valid and step6_valid
+    
     def fix_new_requirements(self, lines: List[str]) -> List[str]:
         """Fix issues based on new requirements"""
         fixed_lines = []
@@ -893,9 +1094,17 @@ class PDFToMarkdownProcessor:
                 i += 1
                 continue
             elif re.search(r'^###\s+ARTÍCULO\s+\d+', line, re.IGNORECASE):
-                in_disposiciones_relacionadas = False
-                in_nota_del_editor = False
-                fixed_lines.append(line)
+                # Check if this is a main article (sequential) or a reference article
+                if in_disposiciones_relacionadas or in_nota_del_editor:
+                    # This is a reference article, should have 4 hashtags
+                    article_content = re.sub(r'^###\s*', '', line.strip())
+                    fixed_lines.append(f"#### {article_content}\n")
+                    self.fixes_applied['article_hierarchy_fixes'] += 1
+                else:
+                    # This is a main article, keep 3 hashtags and exit reference sections
+                    in_disposiciones_relacionadas = False
+                    in_nota_del_editor = False
+                    fixed_lines.append(line)
                 i += 1
                 continue
             elif re.search(r'^##\s+(SECCIÓN|CAPÍTULO|TÍTULO)', line, re.IGNORECASE):
@@ -904,6 +1113,11 @@ class PDFToMarkdownProcessor:
                 fixed_lines.append(line)
                 i += 1
                 continue
+            
+            # Exit reference sections when we encounter major section headers
+            if re.search(r'^(SUJETOS|NACIMIENTO|BASE\s+IMPONIBLE)', line.strip(), re.IGNORECASE):
+                in_disposiciones_relacionadas = False
+                in_nota_del_editor = False
             
             if re.search(r'##\s*\|\s*DECRETOS\s+SUPREMOS', line, re.IGNORECASE):
                 fixed_line = re.sub(r'^##\s*', '', line)
@@ -980,6 +1194,7 @@ class PDFToMarkdownProcessor:
         in_indice_section = False
         skip_malformed_table = False
         last_was_table_line = False
+        pending_table_row = None  # To handle broken table rows
         
         for i, line in enumerate(lines):
             original_line = line
@@ -990,18 +1205,34 @@ class PDFToMarkdownProcessor:
                 in_indice_section = False
                 skip_malformed_table = False
                 last_was_table_line = False
+                pending_table_row = None
                 fixed_lines.append(line)
                 continue
             
-            # Detect ÍNDICE section - start skipping everything from here
-            if (re.search(r'^ÍNDICE\s*$', line.strip(), re.IGNORECASE) or 
-                'ÍNDICE' in line and not self.is_table_line(line)):
-                in_indice_section = True
-                in_table_section = False
-                skip_malformed_table = False
-                last_was_table_line = False
-                # Skip this line and everything in the ÍNDICE section
-                continue
+            # FIXED: More specific ÍNDICE detection to avoid removing legitimate content
+            # Only detect ÍNDICE if it's a standalone section header, not part of other content
+            if (re.search(r'^ÍNDICE\s*$', line.strip(), re.IGNORECASE) and 
+                not self.is_table_line(line) and 
+                not line.strip().startswith('#')):
+                # Look ahead to confirm this is actually an index section
+                is_real_indice = False
+                for j in range(i + 1, min(i + 10, len(lines))):
+                    if (re.search(r'Capítulo\s+[IVX]+', lines[j], re.IGNORECASE) or
+                        re.search(r'\.{5,}', lines[j]) or
+                        re.search(r'DECRETO\s+SUPREMO', lines[j], re.IGNORECASE)):
+                        is_real_indice = True
+                        break
+                    elif re.search(r'^###?\s+ARTÍCULO\s+\d+', lines[j], re.IGNORECASE):
+                        # If we find an article soon after, this is not an index
+                        break
+                
+                if is_real_indice:
+                    in_indice_section = True
+                    in_table_section = False
+                    skip_malformed_table = False
+                    last_was_table_line = False
+                    # Skip this line and everything in the ÍNDICE section
+                    continue
             
             # Detect malformed table content that looks like INDICE remnants
             # These are lines that have table-like structure but contain chapter/page info
@@ -1044,26 +1275,31 @@ class PDFToMarkdownProcessor:
                 in_table_section = False
                 last_was_table_line = False
             
-            # Exit INDICE section when we encounter a new major section
+            # FIXED: More conservative INDICE section exit logic
             if in_indice_section:
                 # Look for major section headers that would end the INDICE
-                if (re.search(r'^(IMPUESTOS\s+NACIONALES|TÍTULO\s+[IVX]+|LEY\s+N°)', line.strip(), re.IGNORECASE) and
-                    not re.search(r'ÍNDICE', line, re.IGNORECASE)):
+                # Be more specific about what ends an INDICE section
+                if (re.search(r'^##\s+(IMPUESTOS\s+NACIONALES|TÍTULO\s+[IVX]+|LEY\s+N°|CAPÍTULO|SECCIÓN)', line, re.IGNORECASE) or
+                    re.search(r'^###\s+ARTÍCULO\s+\d+', line, re.IGNORECASE) or
+                    re.search(r'^OBJETO\s*$', line.strip(), re.IGNORECASE) or
+                    re.search(r'^SUJETOS\s*$', line.strip(), re.IGNORECASE)):
                     in_indice_section = False
                     last_was_table_line = False
+                    # Don't continue here - process this line normally
                 else:
                     # Still in INDICE section, skip this line
                     continue
             
-            # Skip everything in ÍNDICE section
+            # Skip everything in ÍNDICE section (this check is now redundant but kept for safety)
             if in_indice_section:
                 continue
             
-            # Protect table layout in TABLAS DE CORRESPONDENCIAS section
-            if in_table_section and self.is_table_line(line):
-                # Don't modify table lines at all - preserve original formatting
+            # FIX 2: Handle table formatting issues in TABLA DE CORRESPONDENCIAS section
+            if in_table_section:
+                # In table sections, preserve all lines exactly as they are
+                # Don't try to combine or modify table rows as this causes scrambling
                 fixed_lines.append(original_line)
-                last_was_table_line = True
+                last_was_table_line = self.is_table_line(line)
                 continue
             
             # Track if current line is a table line for next iteration
@@ -1199,96 +1435,53 @@ class PDFToMarkdownProcessor:
         return 'empty'
 
     def fix_newlines_batch_processing(self, lines: List[str]) -> List[str]:
-        """Apply batch-based intelligent newline processing with refined rules"""
-        from dataclasses import dataclass
-        
-        @dataclass
-        class ContentBlock:
-            content: str
-            type: str
-            line_number: int
-            newlines_after: int
-        
-        # Convert lines to content blocks
-        blocks = []
+        """Apply batch-based intelligent newline processing with refined rules that preserve table formatting"""
+        fixed_lines = []
         i = 0
+        in_table_section = False
         
         while i < len(lines):
             line = lines[i]
+            
+            # Check if we're in a table section
+            if re.search(r'TABLA\s+DE\s+CORRESPONDENCIAS', line, re.IGNORECASE):
+                in_table_section = True
+            elif re.search(r'^##\s+(ANEXO|DECRETO|LEY\s+N°|IMPUESTOS\s+NACIONALES)', line, re.IGNORECASE):
+                in_table_section = False
+            
+            # If we're in a table section, preserve the original formatting
+            if in_table_section:
+                # Preserve original line exactly as is
+                fixed_lines.append(line)
+                i += 1
+                continue
+            
+            # For non-table sections, apply minimal processing
             content_type = self.classify_detailed_content_type(line)
             
             if content_type == 'empty':
-                # Count consecutive empty lines
-                empty_count = 0
-                for j in range(i, len(lines)):
-                    if lines[j].strip() == '':
-                        empty_count += 1
-                    else:
-                        break
-                
-                blocks.append(ContentBlock(
-                    content='',
-                    type='empty',
-                    line_number=i + 1,
-                    newlines_after=empty_count
-                ))
-                i += empty_count
-            else:
-                # Count newlines after this content line
-                newlines_after = 0
-                for j in range(i + 1, len(lines)):
-                    if lines[j].strip() == '':
-                        newlines_after += 1
-                    else:
-                        break
-                
-                blocks.append(ContentBlock(
-                    content=line.strip(),
-                    type=content_type,
-                    line_number=i + 1,
-                    newlines_after=newlines_after
-                ))
-                i += 1
-        
-        # Define refined newline rules
-        optimal_rules = {
-            'title': {'before': 1, 'after': 0},        # Titles: 1 before, 0 after (content follows directly)
-            'subtitle': {'before': 1, 'after': 0},     # Subtitles: 1 before, 0 after
-            'paragraph': {'before': 0, 'after': 0},    # Paragraphs: no extra spacing
-            'list_item': {'before': 0, 'after': 0},    # List items: no extra spacing
-        }
-        
-        # Generate fixed content
-        fixed_lines = []
-        
-        for i, block in enumerate(blocks):
-            if block.type == 'empty':
-                continue  # Skip empty blocks, we'll add them as needed
-            
-            # Special handling for the very first block (no leading newlines)
-            # FIX 1: Remove newline before header - start directly with content
-            if i == 0:
-                # First content block - no leading newlines at all
-                fixed_lines.append(block.content + '\n')
-            else:
-                # Add optimal newlines before content
-                if block.type in optimal_rules:
-                    newlines_before = optimal_rules[block.type]['before']
+                # Skip empty lines but preserve one empty line between different content types
+                if (i > 0 and i < len(lines) - 1 and 
+                    lines[i-1].strip() and lines[i+1].strip()):
+                    # Look ahead to see if next non-empty line is different type
+                    next_line_type = self.classify_detailed_content_type(lines[i+1])
+                    prev_line_type = self.classify_detailed_content_type(lines[i-1])
                     
-                    # Add the specified number of newlines before
-                    if newlines_before > 0:
-                        for _ in range(newlines_before):
-                            fixed_lines.append('\n')
-                
-                # Add the content line
-                fixed_lines.append(block.content + '\n')
-            
-            # Add optimal newlines after content (usually 0 for our refined rules)
-            if block.type in optimal_rules:
-                newlines_after = optimal_rules[block.type]['after']
-                if newlines_after > 0:
-                    for _ in range(newlines_after):
+                    # Preserve empty line between different content types
+                    if (next_line_type in ['title', 'subtitle'] or 
+                        prev_line_type in ['title', 'subtitle']):
                         fixed_lines.append('\n')
+                
+                i += 1
+                continue
+            else:
+                # Add content line with newline
+                if line.endswith('\n'):
+                    fixed_lines.append(line)
+                else:
+                    fixed_lines.append(line + '\n')
+                i += 1
+                continue
         
         return fixed_lines
 
@@ -1359,6 +1552,15 @@ class PDFToMarkdownProcessor:
         temp_file_6 = os.path.join(temp_dir, f"temp_06_table_indice_{base_filename}.md")
         self.write_file(lines, temp_file_6)
         print(f"     Temporal file saved: {temp_file_6}")
+        
+        # VALIDATION: Compare article numbers between Step 5 and Step 6
+        print("\n  VALIDATION: Checking article sequence between Step 5 and Step 6...")
+        validation_result = self.compare_article_numbers_between_steps(temp_file_5, temp_file_6)
+        if not validation_result:
+            print("    WARNING: Article sequence validation failed!")
+            print("    Consider reviewing the article numbering in the output files.")
+        else:
+            print("    ✓ Article sequence validation passed!")
         
         # Step 7: Fix scattered letters
         print("  7. Fixing scattered letters...")
